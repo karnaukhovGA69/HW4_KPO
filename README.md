@@ -10,25 +10,43 @@
 ## Архитектура
 
 ```
-[Client] -> (HTTP) -> [API Gateway / curl]
-        -> Orders Service -> PostgreSQL (orders)
-                          -> transactional outbox -> RabbitMQ exchange `orders.events`
-        <- Payments Service <- RabbitMQ exchange `orders.events`
-                              -> PostgreSQL (payments) с Inbox + Outbox + Ledger
-                              -> RabbitMQ exchange `payments.events`
-        <- Orders Service <- RabbitMQ exchange `payments.events`
+# Гоzон: платежи и заказы
+
+Репозиторий содержит два микросервиса на Go с архитектурой Transactional Outbox + Inbox и обменом событий через RabbitMQ:
+
+- Payments Service — обрабатывает события `orders.created`, ведёт учёт балансов, делает атомарные списания и публикует `payments.processed`.
+- Orders Service — создаёт заказы (status=pending), публикует событие `orders.created` и обновляет статус заказа по событиям платежей.
+
+Оба сервиса принимают `X-User-ID` в заголовке (UUID). RabbitMQ используется с at-least-once доставкой; база — PostgreSQL с таблицами inbox/outbox.
+
+## Что нового
+
+- Гарантия exactly-once списания: Payments Service проверяет inbox, затем ищет существующую запись платежа по `order_id`. Если платеж уже завершён (succeeded/failed), процесс не делает повторного списания. Логи: `payment already processed`, `payment created`, `funds deducted`.
+- Реальное время для клиентов: Orders Service теперь поддерживает WebSocket (endpoint `/orders/{orderID}/ws`) — клиент подключается сразу после создания заказа и получает обновления статуса (pending → paid/failed).
+
+## Архитектура (упрощённо)
+
+```
+[Client] --HTTP--> Orders Service
+                  Orders Service -> PostgreSQL (orders + outbox)
+                  Orders Service -> publishes orders.created -> RabbitMQ
+                  Payments Service <- RabbitMQ orders.created
+                  Payments Service -> PostgreSQL (payments + outbox + ledger)
+                  Payments Service -> publishes payments.processed -> RabbitMQ
+                  Orders Service <- RabbitMQ payments.processed (inbox) -> updates order status
+
+Client may also open WebSocket to Orders Service to receive Order status updates in realtime.
 ```
 
-Гарантии:
+## Быстрый старт
 
-- Заказы создаются с состоянием `pending`. Transactional Outbox гарантирует публикацию события `orders.created`.
-- Payments Service вставляет запись в `payment_inbox`, блокирует счёт пользователя и списывает деньги атомарным `UPDATE ... WHERE user_id = $1`. Дедупликация достигается уникальными ключами `payment_inbox` и `payments(order_id)`.
-- После списания (или отказа) событие `payments.processed` попадает в Outbox и публикуется в RabbitMQ. Orders Service использует `order_inbox` и обновляет статус на `paid` или `failed`.
+1) Запустите инфраструктуру (Postgres, RabbitMQ). Для простоты можно использовать docker compose:
 
-## Быстрый старт без контейнеров
+```bash
+docker compose up --build
+```
 
-1. Запустить PostgreSQL (два экземпляра) и RabbitMQ либо воспользоваться Docker Compose (ниже).
-2. Экспортировать переменные окружения (пример):
+2) Подготовьте переменные окружения (пример):
 
 ```bash
 export ORDERS_DATABASE_URL="postgres://orders:orders@localhost:5433/orders?sslmode=disable"
@@ -37,80 +55,70 @@ export ORDERS_RABBIT_URL="amqp://guest:guest@localhost:5672/"
 export PAYMENTS_RABBIT_URL="$ORDERS_RABBIT_URL"
 ```
 
-3. Запустить сервисы:
+3) Установите зависимости и запустите сервисы локально (в корне репозитория):
 
 ```bash
-GOMODCACHE=$(pwd)/.gomodcache GOCACHE=$(pwd)/.gocache go run ./payments-service/cmd/payments-service
-GOMODCACHE=$(pwd)/.gomodcache GOCACHE=$(pwd)/.gocache go run ./orders-service/cmd/orders-service
+cd orders-service && go mod tidy
+cd ../payments-service && go mod tidy
+
+# в отдельных терминалах
+go run ./payments-service/cmd/payments-service
+go run ./orders-service/cmd/orders-service
 ```
 
-Миграции выполняются автоматически при запуске.
+Миграции выполняются автоматически при старте.
 
-## Docker Compose
+## WebSocket (Orders Service)
 
+- Endpoint: `GET /orders/{orderID}/ws`
+- Заголовок `X-User-ID` обязателен и должен совпадать с владельцем заказа.
+- Формат сообщений от сервера: JSON `{ "order_id": "...", "status": "pending|paid|failed" }`.
+
+Пример подключения (wscat):
+
+```bash
+#wscat -c "ws://localhost:8080/orders/<ORDER_ID>/ws" -H "X-User-ID: <USER_UUID>"
 ```
-docker compose up --build
-```
 
-Поднимутся:
-
-- RabbitMQ + management UI на `http://localhost:15672`
-- PostgreSQL `orders-db` (порт `5433`) и `payments-db` (порт `5434`)
-- `payments-service` на `http://localhost:8081`
-- `orders-service` на `http://localhost:8080`
+При первом подключении клиент сразу получит текущий статус заказа, затем будет получать обновления в реальном времени.
 
 ## API
 
-Все запросы требуют заголовок `X-User-ID` c UUID пользователя.
+Все запросы требуют заголовок `X-User-ID`.
 
-Готовая Postman коллекция лежит в `postman/gozon.postman_collection.json` — достаточно поменять переменные `orders_base`, `payments_base` и `user_id`.
+### Payments Service (по умолчанию `http://localhost:8081`)
 
-### Payments Service (`http://localhost:8081`)
+POST /accounts — создать счёт
+POST /accounts/deposit — пополнить счёт {"amount": <int>}
+GET  /accounts/balance — получить баланс
 
-| Метод | Путь                 | Описание                       |
-|-------|---------------------|--------------------------------|
-| POST  | `/accounts`         | Создать счёт пользователя      |
-| POST  | `/accounts/deposit` | Пополнить счёт (`{"amount":}`) |
-| GET   | `/accounts/balance` | Получить баланс                |
+### Orders Service (по умолчанию `http://localhost:8080`)
 
-Пример:
+POST /orders — создать заказ {"amount": <int>} (возвращает order.id)
+GET  /orders — список заказов пользователя
+GET  /orders/{id} — детали заказа
 
-```bash
-USER=11111111-1111-1111-1111-111111111111
-curl -X POST http://localhost:8081/accounts -H "X-User-ID: $USER"
-curl -X POST http://localhost:8081/accounts/deposit -H "X-User-ID: $USER" -d '{"amount":150000}'
-curl http://localhost:8081/accounts/balance -H "X-User-ID: $USER"
-```
+После создания заказа Payments Service обработает списание асинхронно и отправит `payments.processed`; Orders Service применит результат с помощью inbox механизмов.
 
-### Orders Service (`http://localhost:8080`)
+## Проверка exactly-once
 
-| Метод | Путь             | Описание                                          |
-|-------|-----------------|---------------------------------------------------|
-| POST  | `/orders`       | Создать заказ (`{"amount":}` в копейках/центах)   |
-| GET   | `/orders`       | Список заказов текущего пользователя              |
-| GET   | `/orders/{id}`  | Детали заказа                                     |
+1. Создайте заказ через Orders API.
+2. Убедитесь, что Payments Service получил событие и создал запись платежа (лог `payment created`) и, при успехе, `funds deducted`.
+3. Повторно отправьте то же событие `orders.created` (симуляция повторной доставки) — Payments Service должен логировать `payment already processed` и не списывать деньги повторно.
 
-Пример:
+## Тестирование и сборка
 
 ```bash
-ORDER=$(curl -s -X POST http://localhost:8080/orders \
-  -H "X-User-ID: $USER" \
-  -H "Content-Type: application/json" \
-  -d '{"amount": 100000}' | jq -r '.id')
-
-curl http://localhost:8080/orders/$ORDER -H "X-User-ID: $USER"
-curl http://localhost:8080/orders -H "X-User-ID: $USER"
-```
-
-Создание заказа асинхронно инициирует списание. Статус поменяется на `paid` при успешной обработке платежа или `failed` при недостатке средств / отсутствии счёта. Логику можно наблюдать в логах сервисов и в таблицах `order_inbox`, `payment_inbox`, `payment_outbox`.
-
-## Тестирование
-
-В каждом модуле можно выполнить компиляцию/прогон:
-
-```
 cd payments-service && go test ./...
-cd orders-service && go test ./...
+cd ../orders-service && go test ./...
+
+# сборка
+go build ./...
 ```
 
-Дополнительно можно использовать Postman/Swagger (не включены в репозиторий) для проверки всех REST-эндпоинтов.
+## Примечания для разработчика
+
+- В `orders-service/go.mod` добавлена зависимость `github.com/gorilla/websocket`.
+- Логи сервисов содержат сообщения для отладки процесса списания и вебсокет-событий.
+
+Если хотите, могу добавить пример клиентского скрипта для WebSocket и/unit тесты для payment processor.

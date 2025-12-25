@@ -39,6 +39,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+func (s *Server) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
+	s.mux.HandleFunc(pattern, handler)
+}
+
 func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	userID, err := s.userIDFromRequest(r)
 	if err != nil {

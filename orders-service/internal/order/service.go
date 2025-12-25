@@ -19,11 +19,16 @@ var (
 )
 
 type Service struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	broadcaster interface {
+		BroadcastOrderUpdate(orderID string, status string)
+	}
 }
 
-func NewService(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool}
+func NewService(pool *pgxpool.Pool, broadcaster interface {
+	BroadcastOrderUpdate(orderID string, status string)
+}) *Service {
+	return &Service{pool: pool, broadcaster: broadcaster}
 }
 
 func (s *Service) Create(ctx context.Context, userID uuid.UUID, amount int64) (*Order, error) {
@@ -153,7 +158,6 @@ func (s *Service) ApplyPaymentResult(ctx context.Context, evt contracts.PaymentP
 	}
 
 	if tag.RowsAffected() == 0 {
-		// Already processed.
 		return nil
 	}
 
@@ -176,6 +180,10 @@ func (s *Service) ApplyPaymentResult(ctx context.Context, evt contracts.PaymentP
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrOrderNotFound
+	}
+
+	if s.broadcaster != nil {
+		s.broadcaster.BroadcastOrderUpdate(evt.OrderID, string(status))
 	}
 
 	return tx.Commit(ctx)

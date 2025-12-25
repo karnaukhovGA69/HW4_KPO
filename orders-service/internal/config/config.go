@@ -6,17 +6,16 @@ import (
 	"time"
 )
 
-// Config contains all runtime knobs for the Orders Service.
 type Config struct {
-	HTTPAddr             string
-	DatabaseURL          string
-	RabbitURL            string
-	OrdersExchange       string
-	PaymentsExchange     string
-	PaymentsQueue        string
-	OutboxInterval       time.Duration
-	OutboxBatchSize      int
-	ShutdownGracePeriod  time.Duration
+	HTTPAddr            string
+	DatabaseURL         string
+	RabbitURL           string
+	OrdersExchange      string
+	PaymentsExchange    string
+	PaymentsQueue       string
+	OutboxInterval      time.Duration
+	OutboxBatchSize     int
+	ShutdownGracePeriod time.Duration
 }
 
 func getEnv(key, def string) string {

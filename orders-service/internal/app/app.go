@@ -15,6 +15,7 @@ import (
 	"gozon/orders-service/internal/httpapi"
 	"gozon/orders-service/internal/order"
 	"gozon/orders-service/internal/storage"
+	"gozon/orders-service/internal/websocket"
 	"gozon/pkg/contracts"
 	"gozon/pkg/messaging"
 
@@ -26,6 +27,7 @@ type App struct {
 	logger    *slog.Logger
 	store     *storage.Store
 	orderSvc  *order.Service
+	wsHub     *websocket.Hub
 	publisher messaging.Publisher
 	outbox    *messaging.OutboxDispatcher
 	consumer  *messaging.Consumer
@@ -38,7 +40,9 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		return nil, err
 	}
 
-	orderSvc := order.NewService(store.Pool())
+	wsHub := websocket.NewHub()
+
+	orderSvc := order.NewService(store.Pool(), wsHub)
 
 	publisher, err := messaging.NewRabbitPublisher(cfg.RabbitURL, cfg.OrdersExchange)
 	if err != nil {
@@ -54,6 +58,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	}
 
 	api := httpapi.NewServer(orderSvc, logger)
+	wsHandler := websocket.NewHandler(wsHub, orderSvc)
+	api.HandleFunc("GET /orders/{orderID}/ws", wsHandler.ServeWS)
 	httpSrv := &http.Server{
 		Addr:    cfg.HTTPAddr,
 		Handler: api,
@@ -66,6 +72,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		logger:    logger,
 		store:     store,
 		orderSvc:  orderSvc,
+		wsHub:     wsHub,
 		publisher: publisher,
 		consumer:  consumer,
 		outbox:    outbox,
@@ -80,6 +87,8 @@ func (a *App) Run(ctx context.Context) error {
 	errCh := make(chan error, 2)
 
 	a.outbox.Start(ctx)
+
+	go a.wsHub.Run(ctx)
 
 	go func() {
 		errCh <- a.consumer.Start(ctx, a.handlePaymentMessage)

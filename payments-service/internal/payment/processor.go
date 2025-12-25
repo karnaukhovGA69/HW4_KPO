@@ -64,14 +64,31 @@ func (p *Processor) HandleOrderCreated(ctx context.Context, evt contracts.OrderC
 		return nil
 	}
 
-	_, err = tx.Exec(ctx, `
-		INSERT INTO payments (order_id, user_id, amount, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, NOW(), NOW())
-		ON CONFLICT (order_id) DO NOTHING`,
-		orderID, userID, evt.Amount, StatusProcessing,
-	)
-	if err != nil {
-		return fmt.Errorf("insert payment row: %w", err)
+	var existing Status
+	err = tx.QueryRow(ctx, `
+		SELECT status
+		FROM payments
+		WHERE order_id = $1`,
+		orderID,
+	).Scan(&existing)
+	if err == nil {
+		if existing == StatusSucceeded || existing == StatusFailed {
+			p.logger.Info("payment already processed", "order_id", orderID.String(), "status", existing)
+			return tx.Commit(ctx)
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("select payment: %w", err)
+	} else {
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO payments (order_id, user_id, amount, status, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, NOW(), NOW())`,
+			orderID, userID, evt.Amount, StatusProcessing,
+		)
+		if err != nil {
+			return fmt.Errorf("insert payment row: %w", err)
+		}
+		p.logger.Info("payment created", "order_id", orderID.String(), "user_id", userID.String(), "amount", evt.Amount)
 	}
 
 	status := StatusFailed
@@ -117,6 +134,7 @@ func (p *Processor) HandleOrderCreated(ctx context.Context, evt contracts.OrderC
 			if err != nil {
 				return fmt.Errorf("insert account transaction: %w", err)
 			}
+			p.logger.Info("funds deducted", "order_id", orderID.String(), "user_id", userID.String(), "amount", evt.Amount)
 		}
 	}
 
